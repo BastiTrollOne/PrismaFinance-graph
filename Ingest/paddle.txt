@@ -1,0 +1,7 @@
+1️⃣ Instala PaddleOCR localmente
+
+En tu entorno (el mismo del OCR server):
+
+pip install paddleocr==2.7.0.3
+pip install paddlepaddle==2.5.1  # o paddlepaddle-gpu si tienes GPU
+

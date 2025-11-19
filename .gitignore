@@ -1,0 +1,22 @@
+# .gitignore
+# --- Secretos (NUNCA SUBIR) ---
+.env
+
+# --- Datos Voluminosos (Docker Volumes) ---
+neo4j_data/
+ollama_storage/
+shared_data/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- Archivos temporales de prueba ---
+*.pdf
+*.xlsx

@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+requests
+langchain
+langchain-community
+langchain-experimental
+langchain-core
+neo4j
+json-repair
+pydantic
+langchain-neo4j
+langchain-ollama
