@@ -2,17 +2,18 @@ import os
 import requests
 import sys
 
-# Librerías
+# --- LIBRERÍAS ESTABLES (COMPATIBLES CON LANGCHAIN 0.2) ---
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_community.llms import Ollama
 from langchain_core.documents import Document
-from langchain_neo4j import Neo4jGraph
+from langchain_community.graphs import Neo4jGraph
 
 # --- CONFIGURACIÓN ---
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-db:7687")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "prismafinance123")
 
+# Ajuste automático de URL de ingesta
 _BASE_INGEST_URL = os.getenv("INGESTION_URL", "http://ingestion-service:8000")
 if _BASE_INGEST_URL.endswith("/upload"):
     INGESTION_URL = _BASE_INGEST_URL
@@ -20,9 +21,11 @@ else:
     INGESTION_URL = f"{_BASE_INGEST_URL}/upload"
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service:11434")
+# Usamos el modelo 3B para mejor razonamiento en la construcción del grafo
 MODEL_NAME = "qwen2.5:3b" 
 
 def connect_to_neo4j():
+    """Establece la conexión con la base de datos de grafos."""
     try:
         graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USERNAME, password=NEO4J_PASSWORD)
         graph.refresh_schema()
@@ -34,17 +37,17 @@ def connect_to_neo4j():
 def unify_entities(graph):
     """
     PROTOCOLO DE UNIFICACIÓN 'ESTEROIDES' (Versión Final):
-    1. Limpieza de ruido.
-    2. Normalización segura de nombres (con APOC merge).
+    1. Limpieza de ruido (nodos basura).
+    2. Normalización segura de nombres (quita Sr., Ing., etc.).
     3. Inferencia de relaciones implícitas (Triangulación por Documento).
-    4. Conexión por Palabras Clave (Bridge).
+    4. Conexión por Palabras Clave (Bridge entre islas).
     5. Fusión final por similitud de texto.
     """
     print("🧹 ACTIVANDO PROTOCOLO DE LIMPIEZA Y FUSIÓN AVANZADA...")
     
     try:
         # --- FASE 1: RECOLECCIÓN DE BASURA ---
-        # Borra nodos que son errores de OCR (muy cortos o terminan en puntos)
+        # Borra nodos que son errores de OCR (muy cortos o terminan en puntos/copyright)
         query_trash = """
         MATCH (n) 
         WHERE size(n.id) < 3 OR n.id ENDS WITH '...' OR n.id CONTAINS 'copyright'
@@ -53,12 +56,11 @@ def unify_entities(graph):
         graph.query(query_trash)
 
         # --- FASE 2: NORMALIZACIÓN SEGURA (ANTI-COLISIÓN) ---
-        # Quita prefijos. Si el nombre limpio ya existe, FUSIONA los nodos.
+        # Quita prefijos honoríficos. Si el nombre limpio ya existe, FUSIONA los nodos.
         print("   - Normalizando nombres (Sr./Ing./Dr.)...")
         prefixes = ["Sr.", "Sra.", "Srta.", "Ing.", "Dr.", "Lic.", "Mag.", "Mr.", "Ms."]
         
         for prefix in prefixes:
-            # Esta query usa APOC para mezclar nodos si encuentra duplicados al limpiar
             query_smart_rename = f"""
             MATCH (n)
             WHERE n.id STARTS WITH '{prefix}'
@@ -80,9 +82,8 @@ def unify_entities(graph):
             """
             try:
                 graph.query(query_smart_rename)
-            except Exception as e_apoc:
-                # Si falla APOC (raro), hacemos fallback a renombrado simple
-                # print(f"     (Nota: Fallback simple para {prefix})") 
+            except Exception:
+                # Si falla APOC, ignoramos silenciosamente este paso para no romper el flujo
                 pass
 
         # --- FASE 3: INFERENCIA LÓGICA (TRIANGULACIÓN) ---
@@ -90,12 +91,12 @@ def unify_entities(graph):
         print("   - Infiriendo relaciones directas...")
         
         queries_inference = [
-            # Persona -> Organización
+            # Regla A: Persona -> Organización
             """
             MATCH (p:Persona)<-[:MENTIONS]-(d:Document)-[:MENTIONS]->(o:Organizacion)
             MERGE (p)-[:PERTENECE_A {source: 'Inferencia'}]->(o)
             """,
-            # Persona -> Proyecto
+            # Regla B: Persona -> Proyecto
             """
             MATCH (p:Persona)<-[:MENTIONS]-(d:Document)-[:MENTIONS]->(proj:Proyecto)
             MERGE (p)-[:TRABAJA_EN {source: 'Inferencia'}]->(proj)
@@ -105,7 +106,7 @@ def unify_entities(graph):
             graph.query(q)
 
         # --- FASE 4: PEGAMENTO DE PALABRAS CLAVE (BRIDGE) ---
-        # Une islas disconexas si comparten palabras clave críticas del negocio
+        # Une islas desconectadas si comparten palabras clave críticas del negocio
         keywords = ["Cobre", "Titán", "Expansión", "Modernización", "Vibra", "Finanzas"]
         for kw in keywords:
             query_glue = f"""
@@ -120,7 +121,7 @@ def unify_entities(graph):
             graph.query(query_glue)
 
         # --- FASE 5: FUSIÓN FINAL POR SIMILITUD ---
-        # La red de seguridad para "Juan Perez" vs "Juan Pérez"
+        # La red de seguridad para typos o nombres parciales (ej: "Juan Perez" vs "Juan Pérez")
         print("   - Fusionando por similitud de texto...")
         query_merge_sim = """
         MATCH (n1), (n2)
@@ -134,24 +135,28 @@ def unify_entities(graph):
         print("✨ GRAFO OPTIMIZADO, LIMPIO Y CONECTADO.")
         
     except Exception as e:
-        print(f"⚠️ Alerta en proceso de limpieza: {e}")
+        print(f"⚠️ Alerta no crítica durante la limpieza: {e}")
 
 def ingest_document(file_path):
+    """Envía el archivo al servicio de ingesta y recibe el texto estructurado."""
     print(f"📤 Enviando '{file_path}' a ingesta...")
     try:
         with open(file_path, 'rb') as f:
             response = requests.post(
                 INGESTION_URL, 
                 files={'file': f}, 
-                params={"chunk_size": 2000, "chunk_overlap": 200} # Chunk más grande para mejor contexto
+                # Chunk size más grande para que Qwen tenga mejor contexto
+                params={"chunk_size": 2500, "chunk_overlap": 200}
             )
         if response.status_code != 200:
-            raise Exception(f"Error Ingesta: {response.text}")
+            raise Exception(f"Error Ingesta ({response.status_code}): {response.text}")
         return response.json()
     except Exception as e:
-        raise Exception(f"Fallo en request: {e}")
+        raise Exception(f"Fallo en request de ingesta: {e}")
 
 def run_graph_extraction(file_path):
+    """Orquesta todo el proceso: Ingesta -> Extracción LLM -> Guardado -> Limpieza."""
+    
     # 1. Ingesta
     try:
         raw_data = ingest_document(file_path)
@@ -159,7 +164,7 @@ def run_graph_extraction(file_path):
         print(f"❌ Error crítico en ingesta: {e}")
         return
 
-    # Convertir a LangChain
+    # Convertir a Documentos LangChain
     lc_docs = []
     if "page_content" in raw_data:
         lc_docs.append(Document(page_content=raw_data["page_content"], metadata=raw_data.get("metadata", {})))
@@ -167,47 +172,50 @@ def run_graph_extraction(file_path):
         for d in raw_data["documents"]:
             lc_docs.append(Document(page_content=d["page_content"], metadata=d.get("metadata", {})))
             
-    print(f"📄 Procesando {len(lc_docs)} fragmentos.")
+    print(f"📄 Procesando {len(lc_docs)} fragmentos de texto.")
 
     # 2. Configurar LLM
-    print(f"🧠 Inicializando {MODEL_NAME}...")
+    print(f"🧠 Inicializando modelo {MODEL_NAME}...")
     try:
         llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0)
         
-        # Prompt en Español para la extracción
+        # Prompt estructurado para finanzas
         llm_transformer = LLMGraphTransformer(
             llm=llm,
             allowed_nodes=["Organizacion", "Persona", "Proyecto", "Monto", "Fecha", "Concepto"],
-            allowed_relationships=["FINANCIA", "DIRIGE", "TIENE_COSTO", "TIENE_PRESUPUESTO", "PERTENECE_A"],
+            allowed_relationships=["FINANCIA", "DIRIGE", "TIENE_COSTO", "TIENE_PRESUPUESTO", "PERTENECE_A", "MENTIONS"],
+            # Nota: Quitamos node_properties para compatibilidad total
         )
     except Exception as e:
-        print(f"❌ Error LLM: {e}")
+        print(f"❌ Error configurando LLM: {e}")
         return
 
     # 3. Extraer
-    print("⛏️  Extrayendo grafo...")
+    print("⛏️  Extrayendo grafo (esto puede tardar)...")
     try:
         graph_documents = llm_transformer.convert_to_graph_documents(lc_docs)
     except Exception as e:
-        print(f"❌ Falló extracción: {e}")
+        print(f"❌ Falló la extracción del grafo: {e}")
         return
 
     # 4. Guardar y Unificar
     if graph_documents:
         try:
-            print("💾 Guardando en Neo4j...")
+            print("💾 Guardando datos en Neo4j...")
             graph = connect_to_neo4j()
             graph.add_graph_documents(graph_documents, baseEntityLabel=True, include_source=True)
             
-            # AQUÍ OCURRE LA MAGIA AUTOMÁTICA
+            # --- EJECUCIÓN DE AUTO-CORRECCIÓN ---
             unify_entities(graph) 
+            # ------------------------------------
             
-            print("🎉 ¡Conocimiento guardado y conectado!")
+            print("🎉 ¡Conocimiento guardado y conectado exitosamente!")
         except Exception as e:
-             print(f"❌ Error guardando: {e}")
+             print(f"❌ Error guardando en base de datos: {e}")
     else:
-        print("⚠️ No se encontró información relevante.")
+        print("⚠️ El modelo no encontró entidades relevantes para guardar.")
 
 if __name__ == "__main__":
+    # Permite ejecutar el script manualmente para pruebas: python graph_agent.py ruta/al/archivo.pdf
     if len(sys.argv) > 1:
         run_graph_extraction(sys.argv[1])

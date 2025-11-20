@@ -2,12 +2,11 @@ fastapi
 uvicorn
 python-multipart
 requests
-langchain
-langchain-community
-langchain-experimental
-langchain-core
+# Stack estable 0.2 (Todo incluido)
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-core==0.2.38
+langchain-experimental==0.0.64
 neo4j
 json-repair
 pydantic
-langchain-neo4j
-langchain-ollama
