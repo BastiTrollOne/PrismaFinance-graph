@@ -158,7 +158,9 @@ def process_graph_in_background(file_path: str):
 async def proxy_upload(request: Request, background_tasks: BackgroundTasks):
     print(f"📥 Recibiendo archivo...")
     content_type = request.headers.get("content-type", "").lower()
-    filename = "doc.bin"
+    
+    # Intentar leer cabecera personalizada primero
+    filename = request.headers.get("x-filename", "doc.bin") 
     file_content = b""
     
     if content_type.startswith("multipart/form-data"):

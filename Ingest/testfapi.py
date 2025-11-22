@@ -557,27 +557,29 @@ def process_file_bytes(filename: str,
                        chunk_size: int,
                        chunk_overlap: int,
                        pdf_text_threshold: int) -> Tuple[str, Dict[str, Any], List[Tuple[int, int, str]], List[Dict[str, Any]]]:
+    
     name = (filename or "").lower()
+    # Normalizamos el content-type para evitar errores de mayúsculas o parámetros extra
+    ctype = (content_type or "").lower().split(";")[0].strip()
+
     page_meta: Dict[str, Any] = {"pages": [{"page_index": 1, "page_source": "digital", "ocr_regions": 0}], "ocr_engine": None, "ocr_confidence_avg": None}
 
-    if name.endswith(".pdf"):
+    # --- CORRECCIÓN AQUÍ: Mirar extensión O Content-Type ---
+    if name.endswith(".pdf") or ctype == "application/pdf":
         unified_text, page_meta = extract_pdf_with_policy(raw, ocr_mode, pdf_text_threshold)
-    elif name.endswith(".docx"):
-        unified_text = extract_from_docx(raw)
-    elif name.endswith(".xlsx") or name.endswith(".csv"):
-        unified_text = extract_from_xlsx_or_csv(filename, raw)
-    elif name.endswith(".txt"):
-        unified_text = extract_from_txt(raw)
-    elif name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg"):
-        unified_text, page_meta = extract_from_image(raw, ocr_mode)
-    else:
-        if (content_type or "").startswith("image/"):
-            unified_text, page_meta = extract_from_image(raw, ocr_mode)
-        elif (content_type or "").startswith("text/"):
-            unified_text = extract_from_txt(raw)
         
-        else:
-            unified_text = extract_from_txt(raw)  # último recurso
+    elif name.endswith(".docx") or ctype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        unified_text = extract_from_docx(raw)
+        
+    elif name.endswith((".xlsx", ".csv")) or ctype in ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]:
+        unified_text = extract_from_xlsx_or_csv(filename, raw)
+        
+    elif name.endswith((".png", ".jpg", ".jpeg")) or ctype.startswith("image/"):
+        unified_text, page_meta = extract_from_image(raw, ocr_mode)
+        
+    else:
+        # Fallback a texto plano solo si no es nada de lo anterior
+        unified_text = extract_from_txt(raw)
 
         # 🔹 Normalizar SOLO si es OCR/imagen/PDF (no aplicar a CSV/XLSX)
     if NORMALIZE_OCR:

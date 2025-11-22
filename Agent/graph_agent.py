@@ -146,7 +146,7 @@ def ingest_document(file_path):
                 INGESTION_URL, 
                 files={'file': f}, 
                 # Chunk size más grande para que Qwen tenga mejor contexto
-                params={"chunk_size": 2500, "chunk_overlap": 200}
+                params={"chunk_size": 1000, "chunk_overlap": 100}
             )
         if response.status_code != 200:
             raise Exception(f"Error Ingesta ({response.status_code}): {response.text}")
