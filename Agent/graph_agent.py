@@ -146,7 +146,7 @@ def ingest_document(file_path):
                 INGESTION_URL, 
                 files={'file': f}, 
                 # Chunk size más grande para que Qwen tenga mejor contexto
-                params={"chunk_size": 1000, "chunk_overlap": 100}
+                params={"chunk_size": 1000, "chunk_overlap": 300}
             )
         if response.status_code != 200:
             raise Exception(f"Error Ingesta ({response.status_code}): {response.text}")
@@ -182,8 +182,22 @@ def run_graph_extraction(file_path):
         # Prompt estructurado para finanzas
         llm_transformer = LLMGraphTransformer(
             llm=llm,
-            allowed_nodes=["Organizacion", "Persona", "Proyecto", "Monto", "Fecha", "Concepto"],
-            allowed_relationships=["FINANCIA", "DIRIGE", "TIENE_COSTO", "TIENE_PRESUPUESTO", "PERTENECE_A", "MENTIONS"],
+            allowed_nodes=[
+            "Organizacion", 
+            "Persona", 
+            "Proyecto", 
+            "Monto", 
+            "Fecha", 
+            "Concepto", 
+            "Costo",          # Nuevo
+            "Presupuesto"     # Nuevo
+        ],
+            allowed_relationships=["FINANCIA",
+             "DIRIGE",
+             "TIENE_COSTO",
+             "TIENE_PRESUPUESTO",
+             "PERTENECE_A",
+             "MENTIONS"],
             # Nota: Quitamos node_properties para compatibilidad total
         )
     except Exception as e:
