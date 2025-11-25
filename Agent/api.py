@@ -13,59 +13,58 @@ from langchain_community.graphs import Neo4jGraph
 from langchain_community.chat_models import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Conexión con el motor de ingesta
+# Importación del motor
 from graph_agent import run_graph_extraction
 
 app = FastAPI(title="PrismaFinance Nuclear Agent")
 
-# ==============================================================================
 # CONFIGURACIÓN
-# ==============================================================================
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-db:7687")
 NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASSWORD", "prismafinance123")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service:11434")
 CHAT_MODEL = "qwen2.5:3b"
+INGESTION_SERVICE = os.getenv("INGESTION_URL", "http://ingestion-service:8000")
+INTERNAL_UPLOAD_URL = f"{INGESTION_SERVICE}/upload"
 
-# ==============================================================================
-# PROMPT DE INGENIERÍA ROBUSTA
-# ==============================================================================
-SYSTEM_PROMPT = """You are the Chief Data Architect for PrismaFinance.
-Your goal: Generate Cypher queries that find HIDDEN CONNECTIONS in a hybrid graph.
+# PROMPT MAESTRO
+SYSTEM_PROMPT = """You are the Supreme Data Architect for PrismaFinance.
+Your mission is to generate Cypher queries that retrieve data regardless of structural ambiguity.
 
-# PROTOCOLS FOR ROBUST QUERYING:
+# GLOBAL SEARCH PROTOCOLS (THE "GOD MODE" RULES):
 
-### 1. Safe Type Handling (CRITICAL)
-- Some nodes might have merged IDs. ALWAYS use `toString()` before `toLower()`.
-- **Pattern:** `WHERE toLower(toString(n.id)) CONTAINS 'search_term'`
+### 1. Entity Agnosticism (NEVER ASSUME TYPES)
+User questions are ambiguous.
+- **GOD MODE:** `MATCH (n:Persona|Organizacion|Proyecto|Concepto) WHERE toLower(toString(n.id)) CONTAINS 'term'`
 
-### 2. The "Star Search" Pattern
-When a user asks about a Person and multiple topics (Money + Text), search for the Person and EVERYTHING connected to them.
-- **Pattern:** `MATCH (p:Persona)-[*1..3]-(target) WHERE toLower(toString(p.id)) CONTAINS 'name' AND ...`
+### 2. The "Double Anchor" Strategy
+- Find ALL paths connecting Entity A to Entity B.
+- **Pattern:** `MATCH (a:Persona|Organizacion)-[*1..4]-(b:Persona|Organizacion|Concepto|Monto)`
 
-### 3. Money Polymorphism
-- Money nodes are :Monto, :Costo, :Presupuesto.
-- Filter: `(labels(target) IN [['Monto'], ['Costo'], ['Presupuesto']])`
+### 3. Financial Dragnet
+- **Filter:** `(labels(m) IN [['Monto'], ['Costo'], ['Presupuesto']])`
+- **Value:** `m.id CONTAINS '2000'`
 
-# FEW-SHOT EXAMPLES:
+### 4. Syntax Safety
+- Always use `toString()` before `toLower()`.
+- Always wrap `OR` conditions in parentheses.
 
-Input: "Pedro Maza gastos flota problemas operativos"
+# MASTER EXAMPLES:
+
+Input: "Javiera Silva incidente Transportes Tamarugal"
 Query: 
-MATCH (p:Persona)-[*1..3]-(target) 
-WHERE toLower(toString(p.id)) CONTAINS 'pedro maza' 
-  AND (
-    toLower(toString(target.id)) CONTAINS 'flota' 
-    OR toLower(toString(target.id)) CONTAINS 'problema' 
-    OR labels(target) IN [['Monto'], ['Costo'], ['Presupuesto']]
-  )
-RETURN p.id, labels(target), target.id LIMIT 50
+MATCH (a)-[*1..4]-(b)
+WHERE (toLower(toString(a.id)) CONTAINS 'javiera')
+  AND (toLower(toString(b.id)) CONTAINS 'tamarugal')
+RETURN a.id, labels(a), b.id, labels(b) LIMIT 50
 
-Input: "¿Quién dio los 2 millones?"
+Input: "Quién representa al banco que dio los 2 millones?"
 Query: 
-MATCH (n)-[*1..2]-(m) 
-WHERE (labels(m) IN [['Monto'], ['Costo'], ['Presupuesto']]) 
-  AND toString(m.id) CONTAINS '2' 
-RETURN n.id, m.id
+MATCH (p:Persona)-[*1..4]-(o:Organizacion)-[*1..4]-(m)
+WHERE toLower(toString(o.id)) CONTAINS 'banco'
+  AND (labels(m) IN [['Monto'], ['Costo'], ['Presupuesto']])
+  AND (m.id CONTAINS '2000' OR m.id CONTAINS '2')
+RETURN p.id, o.id, m.id
 
 Schema:
 {schema}
@@ -74,9 +73,6 @@ Schema:
 class QueryRequest(BaseModel):
     query: str
 
-# ==============================================================================
-# UTILIDADES
-# ==============================================================================
 def clean_cypher(text: str) -> str:
     pattern = r"```(?:cypher)?(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
@@ -89,21 +85,16 @@ def clean_cypher(text: str) -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "active", "mode": "self_healing_v1"}
+    return {"status": "active", "mode": "extension_fix_v4"}
 
-# ==============================================================================
-# ENDPOINT DE CHAT (CON AUTO-REPARACIÓN)
-# ==============================================================================
 @app.post("/chat")
 async def chat(request: QueryRequest):
     print(f"🔥 [CHAT] Pregunta: {request.query}")
     try:
-        # 1. Conexión
         graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
         try: graph.refresh_schema()
         except: pass
         
-        # 2. Razonamiento
         llm = ChatOllama(model=CHAT_MODEL, base_url=OLLAMA_URL, temperature=0)
         schema_summary = graph.schema[:2000] if graph.schema else "Schema unavailable"
         
@@ -117,79 +108,54 @@ async def chat(request: QueryRequest):
         cypher_query = clean_cypher(response_msg.content)
         print(f"   🔧 Query: {cypher_query}")
         
-        if not cypher_query:
-            return {"response": "Error: Consulta no generada."}
+        if not cypher_query: return {"response": "Error: Consulta vacía."}
 
-        # 3. Ejecución con AUTO-CURACIÓN (SELF-HEALING)
         print("   ⚡ Ejecutando en Neo4j...")
-        results = []
         try:
             results = graph.query(cypher_query)
         except Exception as db_err:
             error_str = str(db_err)
-            # DETECCIÓN DEL ERROR DE LISTAS ("StringArray")
             if "StringArray" in error_str or "expected a string" in error_str.lower():
-                print("   🚑 ¡ALERTA DE DATOS SUCIOS! Detectada lista en propiedad ID.")
-                print("   🛠️ Iniciando protocolo de reparación automática de DB...")
-                
-                # Query de cirugía: Convierte todas las listas en strings (toma el primer elemento)
-                fix_query = """
-                MATCH (n) WHERE apoc.meta.type(n.id) = 'LIST'
-                SET n.id = toString(n.id[0])
-                RETURN count(n) as fixed_nodes
-                """
+                print("   🚑 Auto-reparando DB...")
                 try:
-                    fix_result = graph.query(fix_query)
-                    print(f"   ✅ Reparación exitosa. Nodos arreglados: {fix_result}")
-                    
-                    # REINTENTO INMEDIATO
-                    print("   🔄 Reintentando consulta original...")
+                    graph.query("MATCH (n) WHERE apoc.meta.type(n.id) = 'LIST' SET n.id = toString(n.id[0])")
                     results = graph.query(cypher_query)
-                except Exception as fix_err:
-                    return {"response": f"Error crítico intentando reparar la DB: {fix_err}"}
+                except: return {"response": f"Error crítico DB: {db_err}"}
             else:
-                # Si es otro error (sintaxis real), fallamos
-                return {"response": f"Error de sintaxis Cypher: {db_err}"}
+                return {"response": f"Error de sintaxis: {db_err}"}
 
         print(f"   🔎 Resultados: {len(results)}")
 
         if not results:
-            return {"response": "No encontré datos conectados. Intenta simplificar la pregunta."}
+            return {"response": "No encontré datos conectados."}
 
-        # 4. Síntesis
         print("   🗣️ Sintetizando...")
         synthesis_prompt = f"""
-        You are a Forensic Financial Auditor.
-        USER QUESTION: "{request.query}"
+        You are an expert Financial Auditor.
+        QUERY: "{request.query}"
         EVIDENCE: {str(results)}
         
-        MISSION:
-        1. Answer the question based ONLY on the EVIDENCE.
-        2. Connect Person -> Issue -> Money if visible.
-        3. Be authoritative. Use Spanish.
+        INSTRUCTIONS:
+        1. Connect the dots based ONLY on the evidence.
+        2. If you see a Person linked to an Organization or Incident, explain the connection.
+        3. Be precise with names and amounts.
+        4. Answer in Spanish.
         """
         final_response = llm.invoke(synthesis_prompt)
         return {"response": final_response.content}
 
     except Exception as e:
-        print(f"❌ Error Crítico: {e}")
+        print(f"❌ Error: {e}")
         return {"response": f"Error interno: {str(e)}"}
-
-# ==============================================================================
-# ENDPOINTS DE CARGA
-# ==============================================================================
-def process_graph_in_background(file_path: str):
-    print(f"🔄 [BG] Procesando: {file_path}")
-    try: run_graph_extraction(file_path)
-    except Exception as e: print(f"❌ [BG] Error: {e}")
 
 @app.api_route("/process", methods=["POST", "PUT"])
 @app.api_route("/upload", methods=["POST", "PUT"])
 async def proxy_upload(request: Request, background_tasks: BackgroundTasks):
-    print(f"📥 [UPLOAD] Recibiendo...")
+    print(f"📥 [UPLOAD] Solicitud de OWUI...")
     content_type = request.headers.get("content-type", "").lower()
-    filename = request.headers.get("x-filename", "upload.bin")
+    filename = request.headers.get("x-filename", "doc.bin")
     file_content = b""
+    
     if content_type.startswith("multipart/form-data"):
         try:
             form = await request.form()
@@ -202,13 +168,51 @@ async def proxy_upload(request: Request, background_tasks: BackgroundTasks):
     if not file_content:
         try: file_content = await request.body()
         except: pass
-    if not file_content: raise HTTPException(400, "Vacío")
+    if not file_content: raise HTTPException(400, "Sin archivo")
 
+    # === CORRECCIÓN DE NOMBRE LARGO (PRESERVANDO EXTENSIÓN) ===
     backup_dir = "/app/backups"
     os.makedirs(backup_dir, exist_ok=True)
-    clean_name = re.sub(r'[^\w\-_\.]', '_', filename)
-    local_path = f"{backup_dir}/{int(time.time())}_{clean_name}"
+    
+    # 1. Separar nombre y extensión
+    base_name = os.path.basename(filename)
+    name_part, ext_part = os.path.splitext(base_name)
+    if not ext_part: ext_part = ".bin" # Fallback si no tiene extensión
+    
+    # 2. Limpiar y recortar solo el nombre
+    clean_name = re.sub(r'[^\w\-_\.]', '_', name_part)
+    if len(clean_name) > 50:
+        clean_name = clean_name[:50]
+    
+    # 3. Reconstruir nombre corto CON extensión original
+    final_filename = f"{clean_name}{ext_part}"
+    local_path = f"{backup_dir}/{int(time.time())}_{final_filename}"
+    
+    print(f"   💾 Guardando como: {final_filename}")
     with open(local_path, "wb") as f: f.write(file_content)
 
-    background_tasks.add_task(process_graph_in_background, local_path)
-    return {"status": "processing", "file": filename}
+    # Ingesta Sincrónica para OWUI
+    try:
+        print(f"   ⚡ Enviando a Ingesta (Sync) para OWUI...")
+        files = {'file': (filename, file_content, content_type)}
+        res = requests.post(
+            INTERNAL_UPLOAD_URL, 
+            files=files, 
+            params={"chunk_size": 1000, "chunk_overlap": 300}
+        )
+        
+        if res.status_code == 200:
+            background_tasks.add_task(process_graph_in_background, local_path)
+            print("   ✅ Retornando JSON válido a OWUI.")
+            return res.json()
+        else:
+            return {"page_content": "", "metadata": {"error": "ingestion_failed"}}
+
+    except Exception as e:
+        print(f"❌ Error en proxy_upload: {e}")
+        return {"page_content": "", "metadata": {"error": str(e)}}
+
+def process_graph_in_background(file_path: str):
+    print(f"🔄 [BG] Disparando graph_agent para: {file_path}")
+    try: run_graph_extraction(file_path)
+    except: pass
