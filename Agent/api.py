@@ -24,53 +24,29 @@ CHAT_MODEL = "qwen2.5:3b"
 INGESTION_SERVICE = os.getenv("INGESTION_URL", "http://ingestion-service:8000")
 INTERNAL_UPLOAD_URL = f"{INGESTION_SERVICE}/upload"
 
-# PROMPT SIMPLIFICADO
-SYSTEM_PROMPT = """You are a Cypher Query Generator.
-Your task is to return a query to find a Persona and their connections.
+# --- 1. PROMPT DE EXTRACCIÓN (EL CEREBRO DE BÚSQUEDA) ---
+# (Este NO lo tocamos, ya funciona bien)
+EXTRACTION_PROMPT = """You are a Named Entity Extractor.
+Task: Extract the main Person or Organization name from the user query.
+Rules:
+1. Output ONLY the name. No explanations. No punctuation.
+2. If multiple entities, pick the most specific Person.
+3. Remove words like "gastos", "roles", "reporto", "problemas".
 
-# INSTRUCTIONS:
-1. Use the pattern: MATCH (p:Persona)-[*1..2]-(related)
-2. Filter p.id using CONTAINS with the user's search term.
-3. Return p and related.
+Example:
+Input: "Que problemas reporto Pedro Maza sobre la flota"
+Output: Pedro Maza
 
-# EXAMPLE:
-Input: "Ana Rojas"
-Query:
-MATCH (p:Persona)-[*1..2]-(related)
-WHERE toLower(toString(p.id)) CONTAINS 'ana'
-RETURN p, related LIMIT 100
+Input: "Gastos de Ana Rojas"
+Output: Ana Rojas
 """
 
 class QueryRequest(BaseModel):
     query: str
 
-def clean_cypher(text: str) -> str:
-    # 1. Extracción
-    pattern = r"```(?:cypher)?(.*?)```"
-    matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-    clean_text = matches[0].strip() if matches else text
-    
-    # 2. Limpieza básica
-    clean_text = clean_text.replace("Cypher:", "").replace("cypher:", "")
-    if "MATCH" in clean_text:
-        clean_text = clean_text[clean_text.find("MATCH"):]
-    
-    # 3. CORRECCIONES MANUALES DE TYPOS (El parche de seguridad)
-    clean_text = clean_text.replace("anarojas", "ana rojas")
-    clean_text = clean_text.replace("anaroja", "ana rojas") # Caso sin 's'
-    clean_text = clean_text.replace("AnaRojas", "Ana Rojas")
-    
-    clean_text = clean_text.replace(".nombre", ".id")
-    clean_text = clean_text.replace("p.name", "p.id")
-    
-    # 4. Limpieza de filtros alucinados
-    clean_text = re.sub(r"AND\s+related\..*?(?=\n|RETURN|$)", "", clean_text, flags=re.IGNORECASE)
-    
-    return clean_text.strip()
-
 @app.get("/health")
 def health():
-    return {"status": "active", "mode": "injection_v7"}
+    return {"status": "active", "mode": "final_audit_v9"}
 
 @app.post("/chat")
 async def chat(request: QueryRequest):
@@ -79,48 +55,58 @@ async def chat(request: QueryRequest):
         graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
         llm = ChatOllama(model=CHAT_MODEL, base_url=OLLAMA_URL, temperature=0)
         
-        # 1. Detección Inteligente del Nombre
-        # Limpiamos palabras clave comunes para aislar el nombre
-        stopwords = ["gastos", "gasto", "roles", "rol", "que", "tiene", "de", "y", "el", "la"]
-        possible_name = request.query.lower()
-        for word in stopwords:
-            possible_name = possible_name.replace(word, "")
-        possible_name = possible_name.strip()
+        # --- FASE 1: EXTRACCIÓN DE ENTIDAD ---
+        print("   🧠 Extrayendo entidad con LLM...")
+        extraction_messages = [
+            SystemMessage(content=EXTRACTION_PROMPT),
+            HumanMessage(content=f"Input: {request.query}")
+        ]
+        entity_name_raw = llm.invoke(extraction_messages).content
         
-        # Si quedó vacío (ej: "gastos y roles"), usar "ana" por defecto para probar
-        if len(possible_name) < 2: possible_name = "ana"
-
-        print(f"   🎯 Nombre detectado (Python): '{possible_name}'")
-
-        # 2. Inyección Directa (Saltamos al LLM para la parte crítica)
-        # En lugar de pedirle al LLM que escriba el WHERE, se lo damos escrito.
+        # Limpieza final
+        entity_name = entity_name_raw.replace("\n", "").replace('"', '').replace("'", "").strip()
+        if len(entity_name) > 30 or " " not in entity_name: 
+            # Fallback por si el modelo alucina frases largas
+            print(f"   ⚠️ Extracción dudosa ('{entity_name}'), aplicando filtro manual...")
+            entity_name = entity_name.split(" sobre")[0].split(" report")[0] 
+            
+        print(f"   🎯 Entidad Identificada: '{entity_name}'")
+        
+        # --- FASE 2: INYECCIÓN SEGURA EN CYPHER ---
+        # Buscamos el nodo y TODO lo conectado a 1 salto (proyectos, costos, documentos)
         cypher_query = f"""
-        MATCH (p:Persona)-[*1..2]-(related)
-        WHERE toLower(toString(p.id)) CONTAINS '{possible_name}'
-        RETURN p, related LIMIT 50
+        MATCH (p)-[*1..2]-(related)
+        WHERE toLower(toString(p.id)) CONTAINS toLower('{entity_name}')
+        RETURN p, related LIMIT 100
         """
         
-        print(f"   🔧 Query Inyectada: {cypher_query.strip()}")
-        
-        print("   ⚡ Ejecutando en Neo4j...")
+        print(f"   ⚡ Ejecutando en Neo4j...")
         results = graph.query(cypher_query)
         print(f"   🔎 Resultados: {len(results)}")
 
         if not results:
-            return {"response": f"No encontré datos para '{possible_name}'. Intenta verificar el nombre."}
+            return {"response": f"No encontré información exacta para '{entity_name}' en el grafo financiero."}
 
+        # --- FASE 3: SÍNTESIS (AQUÍ ESTÁ EL CAMBIO) ---
         print("   🗣️ Sintetizando...")
-        synthesis_prompt = f"""
-        Act as a Financial Auditor.
-        USER QUERY: "{request.query}"
-        EVIDENCE: {str(results)}
         
-        INSTRUCTIONS:
-        1. Identify the person (Ana Rojas) and describe her Roles (look for PERTENECE_A, DIRIGE).
-        2. LIST specific Expenses/Amounts found (look for nodes with money values like 2200000, 150000).
-        3. Explain the context (e.g. Negotiation, Transport).
-        4. Answer in Spanish.
+        # Este es el nuevo prompt agresivo para que lea los Excel
+        synthesis_prompt = f"""
+        You are a Data Extractor. Do not interpret. Just extract facts.
+        USER QUESTION: "{request.query}"
+        DATABASE RECORDS: {str(results)}
+        
+        TASK:
+        1. Look for the person '{entity_name}' in the RECORDS.
+        2. Find any associated MONEY AMOUNTS (look for labels 'Monto', 'Costo', 'Presupuesto' or numbers like 25000000, 3500000).
+        3. Find associated COMPANIES (e.g. AES Andes, Caterpillar) or PROJECTS.
+        4. If you find a cost/payment, say: "Según los registros, [Persona] gestionó un pago de [Monto] a [Empresa] para [Concepto]."
+        5. If the data comes from a Document (text), summarize the role/problem.
+        
+        IMPORTANT: If you see the data in the RECORDS, report it immediately. Do not ask for more details.
+        Answer in Spanish.
         """
+        
         final_response = llm.invoke(synthesis_prompt)
         return {"response": final_response.content}
 
@@ -129,7 +115,7 @@ async def chat(request: QueryRequest):
         traceback.print_exc()
         return {"response": f"Error técnico: {str(e)}"}
 
-# --- RUTAS DE UPLOAD (Mismo código de siempre) ---
+# --- RUTAS DE UPLOAD (Sin cambios) ---
 @app.api_route("/process", methods=["POST", "PUT"])
 @app.api_route("/upload", methods=["POST", "PUT"])
 async def proxy_upload(request: Request, background_tasks: BackgroundTasks):
