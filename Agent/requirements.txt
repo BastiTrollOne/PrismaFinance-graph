@@ -10,3 +10,4 @@ langchain-experimental==0.0.64
 neo4j
 json-repair
 pydantic
+langchain-openai

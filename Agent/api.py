@@ -1,121 +1,173 @@
 import os
-import requests
-import re
 import time
 import traceback
+import uuid
+import re          # <--- AGREGADO
+import requests    # <--- AGREGADO
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel
+from typing import List, Optional
 
 # --- IMPORTS ---
 from langchain_community.graphs import Neo4jGraph
-from langchain_community.chat_models import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from graph_agent import run_graph_extraction
 
-app = FastAPI(title="PrismaFinance Nuclear Agent")
+app = FastAPI(title="PrismaFinance Nuclear Agent (OpenAI Compatible)")
 
-# CONFIGURACIÓN
+# --- CONFIGURACIÓN ---
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-db:7687")
 NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASSWORD", "prismafinance123")
-OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service:11434")
-CHAT_MODEL = "qwen2.5:3b"
+
+# Conexión al LLM Remoto (El cerebro real)
+OPENAI_BASE = os.getenv("OPENAI_API_BASE", "http://192.168.50.1:8900/v1")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "sk-no-key-needed")
+# Modelo que usaremos en el remoto
+REMOTE_MODEL_ID = os.getenv("LLM_MODEL_ID", "unsloth/qwen3-4b-instruct-2507")
+
 INGESTION_SERVICE = os.getenv("INGESTION_URL", "http://ingestion-service:8000")
 INTERNAL_UPLOAD_URL = f"{INGESTION_SERVICE}/upload"
 
-# --- 1. PROMPT DE EXTRACCIÓN (EL CEREBRO DE BÚSQUEDA) ---
-# (Este NO lo tocamos, ya funciona bien)
-EXTRACTION_PROMPT = """You are a Named Entity Extractor.
-Task: Extract the main Person or Organization name from the user query.
-Rules:
-1. Output ONLY the name. No explanations. No punctuation.
-2. If multiple entities, pick the most specific Person.
-3. Remove words like "gastos", "roles", "reporto", "problemas".
+# --- PROMPTS ---
+EXTRACTION_PROMPT = """
+You are an Expert Search Term Extractor for a Financial Knowledge Graph.
+Your goal is to identify the single most important "anchor" term from the user's query to query a Neo4j database.
 
-Example:
-Input: "Que problemas reporto Pedro Maza sobre la flota"
-Output: Pedro Maza
+DATABASE SCHEMA:
+- Personas (e.g., 'Pedro Maza', 'Ana Rojas')
+- Organizaciones (e.g., 'Metso', 'Candelaria')
+- Proyectos (e.g., 'Mantenimiento Planta', 'Candelaria 2030')
+- Conceptos (e.g., 'Bono', 'Presupuesto', 'Auditoría')
 
-Input: "Gastos de Ana Rojas"
+RULES:
+1. Identify the MAIN SUBJECT. It can be a Person, Organization, Project, or Concept.
+2. CLEAN THE TERM: Remove stop words ("el", "la", "de", "sobre") and action verbs ("reporto", "gastó", "dijo").
+3. DO NOT output labels like "Person:" or "Project:". Just the raw term.
+4. IF multiple entities exist, prioritize the most specific proper name (Person > Project > Organization).
+5. IF the query is general (e.g., "resumen del mes"), output "GENERAL".
+
+EXAMPLES:
+Input: "Gastos de viaje de Ana Rojas"
 Output: Ana Rojas
+
+Input: "¿Cuánto presupuesto tiene el Proyecto Candelaria 2030?"
+Output: Candelaria 2030
+
+Input: "Pagos realizados a Metso Outotec"
+Output: Metso Outotec
+
+Input: "Problemas con la flota Komatsu"
+Output: Komatsu
+
+Input: "Dime todo sobre los bonos"
+Output: Bono
 """
 
-class QueryRequest(BaseModel):
-    query: str
-
-@app.get("/health")
-def health():
-    return {"status": "active", "mode": "final_audit_v9"}
-
-@app.post("/chat")
-async def chat(request: QueryRequest):
-    print(f"🔥 [CHAT] Pregunta: {request.query}")
+# --- LÓGICA CENTRAL DEL AGENTE (Separada para reutilizar) ---
+async def run_agent_logic(query: str) -> str:
+    print(f"🔥 [AGENTE] Procesando: {query}")
     try:
         graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
-        llm = ChatOllama(model=CHAT_MODEL, base_url=OLLAMA_URL, temperature=0)
+        llm = ChatOpenAI(
+            model=REMOTE_MODEL_ID,
+            openai_api_base=OPENAI_BASE,
+            openai_api_key=OPENAI_KEY,
+            temperature=0
+        )
         
-        # --- FASE 1: EXTRACCIÓN DE ENTIDAD ---
-        print("   🧠 Extrayendo entidad con LLM...")
+        # 1. Extracción
+        print("   🧠 [1/3] Extrayendo entidad...")
         extraction_messages = [
             SystemMessage(content=EXTRACTION_PROMPT),
-            HumanMessage(content=f"Input: {request.query}")
+            HumanMessage(content=f"Input: {query}")
         ]
-        entity_name_raw = llm.invoke(extraction_messages).content
-        
-        # Limpieza final
-        entity_name = entity_name_raw.replace("\n", "").replace('"', '').replace("'", "").strip()
-        if len(entity_name) > 30 or " " not in entity_name: 
-            # Fallback por si el modelo alucina frases largas
-            print(f"   ⚠️ Extracción dudosa ('{entity_name}'), aplicando filtro manual...")
-            entity_name = entity_name.split(" sobre")[0].split(" report")[0] 
-            
-        print(f"   🎯 Entidad Identificada: '{entity_name}'")
-        
-        # --- FASE 2: INYECCIÓN SEGURA EN CYPHER ---
-        # Buscamos el nodo y TODO lo conectado a 1 salto (proyectos, costos, documentos)
+        entity_name = llm.invoke(extraction_messages).content.strip().replace('"', '').replace("'", "")
+        # Limpieza básica
+        if len(entity_name) > 30: entity_name = entity_name.split(" sobre")[0]
+        print(f"   🎯 Entidad: '{entity_name}'")
+
+        # 2. Búsqueda en Grafo
         cypher_query = f"""
         MATCH (p)-[*1..2]-(related)
         WHERE toLower(toString(p.id)) CONTAINS toLower('{entity_name}')
         RETURN p, related LIMIT 100
         """
-        
-        print(f"   ⚡ Ejecutando en Neo4j...")
+        print("   ⚡ [2/3] Consultando Neo4j...")
         results = graph.query(cypher_query)
-        print(f"   🔎 Resultados: {len(results)}")
-
-        if not results:
-            return {"response": f"No encontré información exacta para '{entity_name}' en el grafo financiero."}
-
-        # --- FASE 3: SÍNTESIS (AQUÍ ESTÁ EL CAMBIO) ---
-        print("   🗣️ Sintetizando...")
         
-        # Este es el nuevo prompt agresivo para que lea los Excel
+        if not results:
+            return f"No encontré registros para '{entity_name}' en la base de datos local."
+
+        # 3. Síntesis
+        print("   🗣️ [3/3] Sintetizando respuesta...")
         synthesis_prompt = f"""
-        You are a Data Extractor. Do not interpret. Just extract facts.
-        USER QUESTION: "{request.query}"
+        You are a Data Extractor.
+        USER QUESTION: "{query}"
         DATABASE RECORDS: {str(results)}
         
-        TASK:
-        1. Look for the person '{entity_name}' in the RECORDS.
-        2. Find any associated MONEY AMOUNTS (look for labels 'Monto', 'Costo', 'Presupuesto' or numbers like 25000000, 3500000).
-        3. Find associated COMPANIES (e.g. AES Andes, Caterpillar) or PROJECTS.
-        4. If you find a cost/payment, say: "Según los registros, [Persona] gestionó un pago de [Monto] a [Empresa] para [Concepto]."
-        5. If the data comes from a Document (text), summarize the role/problem.
-        
-        IMPORTANT: If you see the data in the RECORDS, report it immediately. Do not ask for more details.
+        TASK: Answer the question based ONLY on the RECORDS.
+        If you find costs/payments, specify amounts and companies.
         Answer in Spanish.
         """
-        
-        final_response = llm.invoke(synthesis_prompt)
-        return {"response": final_response.content}
+        final_response = llm.invoke(synthesis_prompt).content
+        return final_response
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error Agente: {e}")
         traceback.print_exc()
-        return {"response": f"Error técnico: {str(e)}"}
+        return f"Error interno del sistema: {str(e)}"
 
-# --- RUTAS DE UPLOAD (Sin cambios) ---
+# --- ENDPOINTS COMPATIBLES CON OPENAI (Para OWUI nativo) ---
+
+@app.get("/v1/models")
+def list_models():
+    # Esto hace que 'PrismaFinance-Agent' aparezca en la lista de OWUI
+    return {
+        "object": "list",
+        "data": [{
+            "id": "PrismaFinance-Agent",
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "prisma-local"
+        }]
+    }
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    # 1. Recibir formato OpenAI
+    body = await request.json()
+    messages = body.get("messages", [])
+    if not messages:
+        raise HTTPException(400, "Sin mensajes")
+    
+    # 2. Extraer la última pregunta del usuario
+    user_query = messages[-1].get("content", "")
+    
+    # 3. Ejecutar lógica del Agente
+    response_text = await run_agent_logic(user_query)
+    
+    # 4. Devolver formato OpenAI
+    return {
+        "id": f"chatcmpl-{uuid.uuid4()}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": body.get("model", "PrismaFinance-Agent"),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": response_text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ready", "mode": "openai-compatible"}
+
+# --- ENDPOINTS DE CARGA (Sin cambios, necesarios para Ingesta) ---
 @app.api_route("/process", methods=["POST", "PUT"])
 @app.api_route("/upload", methods=["POST", "PUT"])
 async def proxy_upload(request: Request, background_tasks: BackgroundTasks):
