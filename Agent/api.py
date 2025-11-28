@@ -38,7 +38,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASSWORD", "prismafinance123")
 # Ajusta la IP de tu servidor de modelos aquí si cambió
 OPENAI_BASE = os.getenv("OPENAI_API_BASE", "http://192.168.50.1:8900/v1")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "sk-no-key-needed")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "ibm/granite-4-h-tiny") 
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen/qwen3-4b-2507") 
 
 INGESTION_SERVICE = os.getenv("INGESTION_URL", "http://ingestion-service:8000")
 INTERNAL_UPLOAD_URL = f"{INGESTION_SERVICE}/upload"
@@ -50,24 +50,46 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 
 # --- 4. PROMPTS ---
 # El prompt mejorado para encontrar entidades (Fase 1)
+# --- En Agent/api.py ---
+
 EXTRACTION_PROMPT = """
-You are an Expert Search Term Extractor for a Financial Knowledge Graph.
-Your goal is to identify the single most important "anchor" term from the user's query.
+You are the **Intent Classifier & Entity Extractor** for a Financial Knowledge Graph.
+Your goal is to translate user questions into precise search signals.
 
-DATABASE SCHEMA:
-- Personas (e.g., 'Pedro Maza', 'Ana Rojas')
-- Organizaciones (e.g., 'Metso', 'Candelaria')
-- Proyectos (e.g., 'Mantenimiento Planta')
-- Conceptos (e.g., 'Bono', 'Presupuesto')
+### 🚨 CRITICAL RULES (Read Carefully):
 
-RULES:
-1. Identify the MAIN SUBJECT. It can be a Person, Organization, Project, or Concept.
-2. Remove stop words ("el", "la", "de") and verbs ("reporto", "gastó").
-3. DO NOT output labels. Just the raw term.
-4. IF multiple entities exist, prioritize the most specific proper name.
-5. IF the query is general (e.g., "resumen del mes"), output "GENERAL".
+1. **NAMED ENTITY RECOGNITION (High Priority)**
+   - If the user asks about a Person, Organization, Project, or Role, extract the **Exact Name**.
+   - **FIX SPACING**: If the user types "Javierasilva", output "Javiera Silva".
+   - **IGNORE FILLER**: Ignore phrases like "in the documents", "in the graph", "loaded files", "tell me about".
+   - *Example:* "Que hace Javiera Silva en los archivos" -> Javiera Silva
+   - *Example:* "Cargo de CarlosVidela" -> Carlos Videla
 
-Example: "Gastos de Ana Rojas" -> Ana Rojas
+2. **NUMERIC & FINANCIAL SEARCH**
+   - If the user asks for a specific amount, extract **ONLY** the number (digits).
+   - *Example:* "Monto de 60000" -> 60000
+   - *Example:* "Facturas mayores a 1000" -> 1000
+
+3. **GLOBAL / DISCOVERY INTENT (General)**
+   - If the user asks for a **Summary**, **Overview**, **Relationships** (without a specific name), **Patterns**, or "What is in the documents?", output exactly: **GENERAL**.
+   - *Example:* "Relaciona los documentos cargados" -> GENERAL
+   - *Example:* "Dame un resumen ejecutivo" -> GENERAL
+   - *Example:* "¿De qué trata el excel cargado?" -> GENERAL
+
+4. **CONCEPTUAL SEARCH**
+   - If the user asks about a concept (e.g., "Interest Rate", "Budget", "Debt"), extract the concept in its simplest form.
+   - *Example:* "Cual es la tasa de interés" -> Tasa de interés
+
+### 🛡️ SAFETY & CLEANING:
+- **Output Format:** JUST the raw term or "GENERAL". No JSON, no labels, no quotes.
+- If multiple entities exist, prioritize the **Proper Name**.
+- If the query is "Hola" or trivial conversation, output: **GENERAL**.
+
+### TEST CASES:
+User: "Gastos de Ana" -> Ana
+User: "Monto 500.000" -> 500000
+User: "Resumen de documentos" -> GENERAL
+User: "Que hace joseperez" -> Jose Perez
 """
 
 class QueryRequest(BaseModel):
@@ -80,9 +102,14 @@ def health():
 
 @app.post("/chat")
 async def chat(request: QueryRequest):
+    # 1. FILTRO ANTI-RUIDO
+    if request.query.strip().startswith("### Task") or "Generate a concise" in request.query:
+        return {"response": "System Task Processed"} 
+
     print(f"🔥 [CHAT] Sesión: {request.session_id} | Pregunta: {request.query}")
+    
     try:
-        # Conexiones
+        # 2. CONEXIONES
         graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
         llm = ChatOpenAI(
             model=CHAT_MODEL,
@@ -91,53 +118,76 @@ async def chat(request: QueryRequest):
             temperature=0
         )
         
-        # --- FASE 1: EXTRACCIÓN DE ENTIDAD ---
-        print("   🧠 Extrayendo entidad...")
+        # 3. INTENCIÓN
+        print("   🧠 Analizando intención...")
         extract_msgs = [SystemMessage(content=EXTRACTION_PROMPT), HumanMessage(content=request.query)]
-        entity_name_raw = llm.invoke(extract_msgs).content
-        entity_name = entity_name_raw.replace("\n", "").replace('"', '').strip()
-        print(f"   🎯 Entidad Clave: '{entity_name}'")
+        entity_name = llm.invoke(extract_msgs).content.replace("\n", "").replace('"', '').replace("'", "").strip()
+        print(f"   🎯 Intención: '{entity_name}'")
         
-        # --- FASE 2: BÚSQUEDA EN NEO4J ---
+        # 4. ESTRATEGIA OPTIMIZADA (LIGHTWEIGHT)
         context_str = ""
-        if "GENERAL" in entity_name.upper():
-            # Búsqueda amplia si no hay entidad clara
-            cypher_query = "MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 50"
+        
+        if "GENERAL" in entity_name.upper() or entity_name == "":
+            print("   🌍 Búsqueda GLOBAL (Optimizada)...")
+            # TRUCO: No traemos el objeto entero (n), solo sus propiedades clave y un recorte del texto.
+            # Esto evita traer 10MB de datos si los nodos tienen PDFs enteros dentro.
+            cypher_query = """
+            MATCH (n)-[r]->(m)
+            WITH n, count(r) as rel_count, collect(r) as rels, collect(m) as targets
+            ORDER BY rel_count DESC
+            LIMIT 5
+            UNWIND rels as r
+            UNWIND targets as m
+            RETURN n.id as Source, type(r) as Rel, m.id as Target, left(toString(m.text), 150) as ContextSnippet
+            LIMIT 30
+            """
         else:
-            # Búsqueda dirigida
+            print(f"   🔍 Búsqueda ESPECÍFICA: '{entity_name}'")
             cypher_query = f"""
-            MATCH (p)-[*1..2]-(related)
+            MATCH (p)-[r]-(related)
             WHERE toLower(toString(p.id)) CONTAINS toLower('{entity_name}')
-            RETURN p, related LIMIT 100
+            RETURN p.id as Source, type(r) as Rel, related.id as Target, left(toString(related.text), 150) as ContextSnippet
+            LIMIT 30
             """
         
+        # 5. EJECUCIÓN
         try:
+            # graph.query devuelve una lista de dicts, mucho más ligera ahora
             results = graph.query(cypher_query)
-            context_str = str(results) if results else "No se encontraron registros exactos en el grafo."
-            print(f"   🔎 Datos encontrados: {len(results)} registros")
-        except Exception as e:
-            context_str = f"Error consultando grafo: {str(e)}"
+            
+            # Convertimos resultados a texto compacto
+            # (Source: X, Rel: Y, Target: Z, Snippet: ...)
+            context_list = []
+            for row in results:
+                context_list.append(str(row))
+            full_context = "\n".join(context_list)
 
-        # --- FASE 3: GENERACIÓN CON MEMORIA ---
+            # Recorte estricto para velocidad (7000 chars ~= 1500 tokens)
+            if len(full_context) > 7000:
+                context_str = full_context[:7000] + "... [truncado]"
+            else:
+                context_str = full_context
+
+            print(f"   🔎 Datos: {len(results)} filas. Peso contexto: {len(context_str)} chars.")
+            
+        except Exception as e:
+            print(f"   ❌ Error Cypher: {e}")
+            context_str = f"Error: {str(e)}"
+
+        # 6. GENERACIÓN
         print("   🗣️ Generando respuesta...")
-        
-        # Prompt que incluye el Historial ({chat_history})
         qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", "Eres un asistente financiero experto. Responde en Español."),
-            ("system", "Tus respuestas deben basarse en el CONTEXTO DEL GRAFO proporcionado."),
-            ("system", "CONTEXTO DEL GRAFO:\n{context}"),
-            MessagesPlaceholder(variable_name="chat_history"), # Aquí entra la memoria
+            ("system", "Eres un analista experto. Responde en Español."),
+            ("system", "Básate SOLO en este resumen de relaciones del grafo:\n{context}"),
+            ("system", "Si el contexto es limitado, explica las relaciones clave que ves."),
+            MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}")
         ])
 
         chain = qa_prompt | llm
-
-        # Cadena con manejo automático de historial
         chain_with_history = RunnableWithMessageHistory(
-            chain,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
+            chain, get_session_history,
+            input_messages_key="input", history_messages_key="chat_history"
         )
 
         response = chain_with_history.invoke(
@@ -149,8 +199,7 @@ async def chat(request: QueryRequest):
 
     except Exception as e:
         print(f"❌ Error: {e}")
-        traceback.print_exc()
-        return {"response": f"Error técnico: {str(e)}"}
+        return {"response": "Error técnico. Ver logs."}
 
 # --- RUTAS DE UPLOAD (Sin cambios) ---
 @app.api_route("/process", methods=["POST", "PUT"])
