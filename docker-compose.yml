@@ -58,7 +58,7 @@ services:
         
         # --- MODELO ESPECÍFICO ---
         # Aquí definimos el nombre exacto que tiene el servidor
-        - LLM_MODEL_ID=unsloth/qwen3-4b-instruct-2507
+        - LLM_MODEL_ID=ibm/granite-4-h-tiny
       
       volumes:
         - ./Documentos_Recibidos:/app/backups

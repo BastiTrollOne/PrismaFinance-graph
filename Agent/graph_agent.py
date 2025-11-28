@@ -27,38 +27,37 @@ if _BASE_INGEST_URL.endswith("/upload"):
 else:
     INGESTION_URL = f"{_BASE_INGEST_URL}/upload"
 
-OPENAI_BASE = os.getenv("OPENAI_API_BASE", "http://192.168.137.1:8001/v1")
+# CORRECCIÓN 1: URL Base correcta (sin /models) y con la nueva IP
+OPENAI_BASE = os.getenv("OPENAI_API_BASE", "http://192.168.50.1:8900/v1")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "sk-no-key-needed")
-MODEL_NAME = os.getenv("LLM_MODEL_ID", "qwen/qwen3-4b-2507")
+MODEL_NAME = os.getenv("LLM_MODEL_ID", "ibm/granite-4-h-tiny")
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 # ==============================================================================
-# 1. EXTRACTOR PERSONALIZADO (Corregido: Doble corchete para literales)
+# 1. EXTRACTOR PERSONALIZADO
 # ==============================================================================
+# --- HEADER DE EXTRACCIÓN ESTRICTA ---
 # --- HEADER DE EXTRACCIÓN ESTRICTA ---
 STRICT_INSTRUCTION_HEADER = """
 *** INSTRUCCIONES DEL SISTEMA - LEER ATENTAMENTE ***
 ROL: Eres un Ingeniero de Datos riguroso construyendo un Grafo Financiero.
 TAREA: Extraer CADA ENTIDAD y RELACIÓN del texto a continuación.
+Responde ÚNICAMENTE con un JSON válido que tenga las claves "nodes" y "relationships".
 REGLAS CRÍTICAS:
-1. PROHIBIDO RESUMIR: Si hay 20 transacciones, debes extraer 20 sets de nodos. No omitas nada.
-2. TIPOS DE ENTIDAD: Usa SOLO: 'Organizacion', 'Persona', 'Proyecto', 'Monto', 'Concepto'.
-3. RELACIONES PERMITIDAS:
-   - Persona -> GESTIONA -> Proyecto
-   - Organizacion -> TIENE_COSTO -> Monto
-   - Organizacion -> PAGADO_A -> Organizacion (Proveedor)
-   - Persona -> PERTENECE_A -> Organizacion
-4. MONTOS SON NODOS: Los valores numéricos (ej. '450000') son NODOS de tipo 'Monto', NO propiedades.
-5. CONCEPTOS: La descripción del gasto es un nodo 'Concepto'.
-*** FIN INSTRUCCIONES - COMIENZAN LOS DATOS ***
+1. PROHIBIDO RESUMIR: Si hay 20 transacciones, debes extraer 20 sets de nodos.
+2. TIPOS DE ENTIDAD: 'Organizacion', 'Persona', 'Proyecto', 'Monto', 'Concepto'.
+3. RELACIONES: 'GESTIONA', 'TIENE_COSTO', 'PAGADO_A', 'PERTENECE_A'.
+4. FORMATO JSON: {{ "nodes": [{{ "id": "...", "type": "..." }}], "relationships": [{{ "source": "...", "target": "...", "type": "..." }}] }}
+*** FIN INSTRUCCIONES ***
 """
 
 def custom_graph_extraction(llm, text_chunk):
     """Extrae nodos/relaciones usando prompting directo."""
+    # CORRECCIÓN 2: Usamos la variable correcta STRICT_INSTRUCTION_HEADER
     prompt = ChatPromptTemplate.from_messages([
-        ("system", EXTRACTION_SYSTEM_PROMPT),
+        ("system", STRICT_INSTRUCTION_HEADER),
         ("human", "{input}")
     ])
     
